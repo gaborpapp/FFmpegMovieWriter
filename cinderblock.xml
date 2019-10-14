@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<cinder>
+<block
+	name="FFmpegMovieWriter"
+	id="hu.mndl.ffmpeg"
+	author="Gabor Papp"
+	license="BSD"
+	summary="Video recording based on FFmpeg"
+	core="false"
+	version="0.1" >
+	<source>src/FFmpegMovieWriter.cpp</source>
+	<header>src/FFmpegMovieWriter.h</header>
+	<includePath>src</includePath>
+</block>
+</cinder>
