@@ -85,6 +85,9 @@ class FFmpegMovieWriter
 		std::string getCodecVideo() const { return mCodecVideo; }
 		void setCodecVideo( const std::string &codec ) { mCodecVideo = codec; }
 
+		Format & extraOutputArgs( const std::string &args ) { mExtraOutputArgs = args; return *this; }
+		std::string getExtraOutputArgs() const { return mExtraOutputArgs; }
+
 	private:
 		ci::fs::path mPathFFmpeg = "ffmpeg";
 		std::string mCodecVideo = "mpeg4";
@@ -97,6 +100,8 @@ class FFmpegMovieWriter
 		size_t mNumAudioInputChannels = 2;
 
 		ci::SurfaceChannelOrder mVideoChannelOrder = ci::SurfaceChannelOrder( ci::SurfaceChannelOrder::RGB );
+
+		std::string mExtraOutputArgs;
 
 		bool mRecordVideo = true;
 		bool mRecordAudio = false;

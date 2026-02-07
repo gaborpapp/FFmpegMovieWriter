@@ -52,6 +52,7 @@ FFmpegMovieWriter::Format::Format( const Format &format ) :
 	mAudioSampleRate( format.mAudioSampleRate ),
 	mNumAudioInputChannels( format.mNumAudioInputChannels ),
 	mVideoChannelOrder( format.mVideoChannelOrder ),
+	mExtraOutputArgs( format.mExtraOutputArgs ),
 	mRecordVideo( format.mRecordVideo ),
 	mRecordAudio( format.mRecordAudio ),
 	mVerbose( format.mVerbose )
@@ -68,6 +69,7 @@ const FFmpegMovieWriter::Format & FFmpegMovieWriter::Format::operator=( const Fo
 	mAudioSampleRate = format.mAudioSampleRate;
 	mNumAudioInputChannels = format.mNumAudioInputChannels;
 	mVideoChannelOrder = format.mVideoChannelOrder;
+	mExtraOutputArgs = format.mExtraOutputArgs;
 	mRecordVideo = format.mRecordVideo;
 	mRecordAudio = format.mRecordAudio;
 	mVerbose = format.mVerbose;
@@ -118,6 +120,10 @@ void FFmpegMovieWriter::ffmpegThreadFn()
 	{
 		outputSettings << " -c:a " << mFormat.mCodecAudio <<
 			" -b:a " << mFormat.mBitRateAudio;
+	}
+	if ( ! mFormat.mExtraOutputArgs.empty() )
+	{
+		outputSettings << " " << mFormat.mExtraOutputArgs;
 	}
 	outputSettings << " \"" << mPathMovie.string() << "\"";
 
