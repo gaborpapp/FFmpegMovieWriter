@@ -81,6 +81,10 @@ class FFmpegMovieWriter
 		ci::SurfaceChannelOrder getVideoChannelOrder() const { return mVideoChannelOrder; }
 		void setVideoChannelOrder( const ci::SurfaceChannelOrder &channelOrder ) { mVideoChannelOrder = channelOrder; }
 
+		Format & codecVideo( const std::string &codec ) { mCodecVideo = codec; return *this; }
+		std::string getCodecVideo() const { return mCodecVideo; }
+		void setCodecVideo( const std::string &codec ) { mCodecVideo = codec; }
+
 	private:
 		ci::fs::path mPathFFmpeg = "ffmpeg";
 		std::string mCodecVideo = "mpeg4";
