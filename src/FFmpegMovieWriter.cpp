@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 #include <sstream>
 
@@ -146,7 +147,7 @@ void FFmpegMovieWriter::ffmpegThreadFn()
 	sPipeId++;
 
 	std::stringstream cmd;
-		cmd << "bash --login -c '" << mFormat.mPathFFmpeg <<
+		cmd << mFormat.mPathFFmpeg <<
 		( mFormat.mVerbose ? "" : " -loglevel quiet " ) << "-y";
 	if ( mFormat.mRecordAudio )
 	{
@@ -179,22 +180,28 @@ void FFmpegMovieWriter::ffmpegThreadFn()
 	{
 		cmd << " -vn";
 	}
-	cmd << " " + outputSettings.str() + "' &";
+	cmd << " " + outputSettings.str();
 	std::string command = cmd.str();
+	const char *scriptArg = command.c_str();	// capture before fork (async-signal-safe)
 
-
-	int result = system( command.c_str() );
-	int serrno = errno;
-	if ( result == 0 )
+	pid_t pid = ::fork();
+	if ( pid < 0 )
 	{
-		CI_LOG_I( command << " command completed." );
-		mThreadFFmpegInitialized = true;
+		int serrno = errno;
+		CI_LOG_E( "fork failed for ffmpeg: " << ::strerror( serrno ) << "." );
+		// TODO: throw
+	}
+	else
+	if ( pid == 0 )
+	{
+		::execlp( "bash", "bash", "--login", "-c", scriptArg, (char *)NULL );
+		::_exit( 127 );
 	}
 	else
 	{
-		CI_LOG_E( command << " command failed with result: " << result
-							<< " - " << ::strerror( serrno ) << "." );
-		// TODO: throw
+		mFFmpegPid = pid;
+		mThreadFFmpegInitialized = true;
+		CI_LOG_I( "ffmpeg started (pid " << mFFmpegPid << "): " << command );
 	}
 
 	if ( mFormat.mRecordAudio )
@@ -211,6 +218,21 @@ void FFmpegMovieWriter::cleanupFFmpeg()
 {
 	mThreadFFmpeg->join();
 	mThreadFFmpeg.reset();
+
+	// The fifo write-ends were closed by cleanupVideoThread()/cleanupAudioThread()
+	// in the destructor, so ffmpeg has received EOF; wait for it to finish writing
+	// the moov atom and exit before the file is treated as complete.
+	if ( mFFmpegPid > 0 )
+	{
+		int status = 0;
+		pid_t r;
+		do
+		{
+			r = ::waitpid( mFFmpegPid, &status, 0 );
+		}
+		while ( r < 0 && errno == EINTR );
+		mFFmpegPid = -1;
+	}
 
 	if ( mFormat.mRecordVideo )
 	{

@@ -126,7 +126,7 @@ class FFmpegMovieWriter
 
 	const Format mFormat;
 
-	pid_t mFFmpegPid;
+	pid_t mFFmpegPid = -1;
 
 	void setupFFmpeg();
 	void cleanupFFmpeg();
