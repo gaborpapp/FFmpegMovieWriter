@@ -254,9 +254,14 @@ void FFmpegMovieWriter::setupVideoThread()
 
 void FFmpegMovieWriter::cleanupVideoThread()
 {
+	// Queue a null frame as an end-of-stream marker: the video thread drains every frame
+	// still buffered before it hits the marker and exits, so the tail of a recording is
+	// not discarded
+	mVideoFrames->pushFront( Surface8uRef() );
+	mThreadVideo->join();
+
 	mVideoThreadShouldQuit = true;
 	mVideoFrames->cancel();
-	mThreadVideo->join();
 	mThreadVideo.reset();
 	delete mVideoFrames;
 	mVideoFrames = nullptr;
