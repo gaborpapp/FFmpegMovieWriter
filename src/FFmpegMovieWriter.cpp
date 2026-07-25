@@ -254,17 +254,29 @@ void FFmpegMovieWriter::setupVideoThread()
 
 void FFmpegMovieWriter::cleanupVideoThread()
 {
-	// Queue a null frame as an end-of-stream marker: the video thread drains every frame
-	// still buffered before it hits the marker and exits, so the tail of a recording is
-	// not discarded
-	mVideoFrames->pushFront( Surface8uRef() );
-	mThreadVideo->join();
+	// The thread and its buffer are created at the end of ffmpegThreadFn, so both are
+	// still null if the writer is destroyed right after being created
+	if ( mThreadVideo )
+	{
+		// Queue a null frame as an end-of-stream marker: the video thread drains every
+		// frame still buffered before it hits the marker and exits, so the tail of a
+		// recording is not discarded
+		if ( mVideoFrames )
+		{
+			mVideoFrames->pushFront( Surface8uRef() );
+		}
+		mThreadVideo->join();
+		mThreadVideo.reset();
+	}
 
 	mVideoThreadShouldQuit = true;
-	mVideoFrames->cancel();
-	mThreadVideo.reset();
-	delete mVideoFrames;
-	mVideoFrames = nullptr;
+
+	if ( mVideoFrames )
+	{
+		mVideoFrames->cancel();
+		delete mVideoFrames;
+		mVideoFrames = nullptr;
+	}
 }
 
 void FFmpegMovieWriter::videoThreadFn()
@@ -383,12 +395,29 @@ void FFmpegMovieWriter::setupAudioThread()
 
 void FFmpegMovieWriter::cleanupAudioThread()
 {
+	// The thread and its buffer are created at the end of ffmpegThreadFn, so both are
+	// still null if the writer is destroyed right after being created
+	if ( mThreadAudio )
+	{
+		// Queue a null frame as an end-of-stream marker: the audio thread drains every
+		// frame still buffered before it hits the marker and exits, so the tail of a
+		// recording is not discarded and its heap allocations are not leaked
+		if ( mAudioFrames )
+		{
+			mAudioFrames->pushFront( nullptr );
+		}
+		mThreadAudio->join();
+		mThreadAudio.reset();
+	}
+
 	mAudioThreadShouldQuit = true;
-	mAudioFrames->cancel();
-	mThreadAudio->join();
-	mThreadAudio.reset();
-	delete mAudioFrames;
-	mAudioFrames = nullptr;
+
+	if ( mAudioFrames )
+	{
+		mAudioFrames->cancel();
+		delete mAudioFrames;
+		mAudioFrames = nullptr;
+	}
 }
 
 void FFmpegMovieWriter::audioThreadFn()
