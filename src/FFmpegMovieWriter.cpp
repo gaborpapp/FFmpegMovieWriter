@@ -88,6 +88,12 @@ FFmpegMovieWriter::FFmpegMovieWriter( const ci::fs::path &path,
 
 FFmpegMovieWriter::~FFmpegMovieWriter()
 {
+	// ffmpegThreadFn creates the video/audio threads, so it has to finish before
+	// they are cleaned up; otherwise a writer destroyed right after creation could
+	// have its threads spawned after the cleanup calls found them still null
+	mThreadFFmpeg->join();
+	mThreadFFmpeg.reset();
+
 	if ( mFormat.mRecordVideo )
 	{
 		cleanupVideoThread();
@@ -182,14 +188,17 @@ void FFmpegMovieWriter::ffmpegThreadFn()
 	}
 	cmd << " " + outputSettings.str();
 	std::string command = cmd.str();
-	const char *scriptArg = command.c_str();	// capture before fork (async-signal-safe)
+	const char *scriptArg = command.c_str();	// the child must not allocate between fork and exec
 
 	pid_t pid = ::fork();
 	if ( pid < 0 )
 	{
 		int serrno = errno;
 		CI_LOG_E( "fork failed for ffmpeg: " << ::strerror( serrno ) << "." );
+		// Without ffmpeg reading the fifos the writer threads would block forever
+		// in open(), so don't start them
 		// TODO: throw
+		return;
 	}
 	else
 	if ( pid == 0 )
@@ -216,9 +225,6 @@ void FFmpegMovieWriter::ffmpegThreadFn()
 
 void FFmpegMovieWriter::cleanupFFmpeg()
 {
-	mThreadFFmpeg->join();
-	mThreadFFmpeg.reset();
-
 	// The fifo write-ends were closed by cleanupVideoThread()/cleanupAudioThread()
 	// in the destructor, so ffmpeg has received EOF; wait for it to finish writing
 	// the moov atom and exit before the file is treated as complete.
@@ -231,6 +237,20 @@ void FFmpegMovieWriter::cleanupFFmpeg()
 			r = ::waitpid( mFFmpegPid, &status, 0 );
 		}
 		while ( r < 0 && errno == EINTR );
+		if ( r == mFFmpegPid )
+		{
+			if ( WIFEXITED( status ) && ( WEXITSTATUS( status ) != 0 ) )
+			{
+				CI_LOG_E( "ffmpeg exited with status " << WEXITSTATUS( status )
+									<< ", the recording is probably incomplete." );
+			}
+			else
+			if ( WIFSIGNALED( status ) )
+			{
+				CI_LOG_E( "ffmpeg was killed by signal " << WTERMSIG( status )
+									<< ", the recording is probably incomplete." );
+			}
+		}
 		mFFmpegPid = -1;
 	}
 
@@ -268,8 +288,6 @@ void FFmpegMovieWriter::cleanupVideoThread()
 		mThreadVideo->join();
 		mThreadVideo.reset();
 	}
-
-	mVideoThreadShouldQuit = true;
 
 	if ( mVideoFrames )
 	{
@@ -409,8 +427,6 @@ void FFmpegMovieWriter::cleanupAudioThread()
 		mThreadAudio->join();
 		mThreadAudio.reset();
 	}
-
-	mAudioThreadShouldQuit = true;
 
 	if ( mAudioFrames )
 	{
