@@ -23,8 +23,11 @@
 
 #pragma once
 
+#if ! defined( _WIN32 )
 #include <unistd.h>
+#endif
 
+#include <atomic>
 #include <memory>
 #include <string>
 
@@ -88,6 +91,14 @@ class FFmpegMovieWriter
 		Format & extraOutputArgs( const std::string &args ) { mExtraOutputArgs = args; return *this; }
 		std::string getExtraOutputArgs() const { return mExtraOutputArgs; }
 
+		//! Path of the ffmpeg executable. Default: "ffmpeg", searched on the PATH.
+		Format & pathFFmpeg( const ci::fs::path &path ) { mPathFFmpeg = path; return *this; }
+		ci::fs::path getPathFFmpeg() const { return mPathFFmpeg; }
+
+		//! Lets ffmpeg print its log. Default: false.
+		Format & verbose( bool verbose = true ) { mVerbose = verbose; return *this; }
+		bool getVerbose() const { return mVerbose; }
+
 	private:
 		ci::fs::path mPathFFmpeg = "ffmpeg";
 		std::string mCodecVideo = "mpeg4";
@@ -120,13 +131,35 @@ class FFmpegMovieWriter
 	void addFrame( ci::Surface8uRef surface );
 	void addAudioBuffer( const ci::audio::Buffer *buffer );
 
+	//! True if ffmpeg could not be started, exited early or a write to it failed.
+	//! Frames added after a failure are dropped.
+	bool hasFailed() const { return mFailed; }
+
  protected:
 	FFmpegMovieWriter( const ci::fs::path &path, int32_t width, int32_t height,
 			const Format &format );
 
 	const Format mFormat;
 
+#if defined( _WIN32 )
+	void *mFFmpegProcess = nullptr; // HANDLE
+	void *mPipeHandleVideo = nullptr; // HANDLE
+	void *mPipeHandleAudio = nullptr; // HANDLE
+	void *createPipe( const ci::fs::path &name );
+	//! Waits until ffmpeg opens the pipe. False if ffmpeg exits first.
+	bool connectPipe( void *pipe );
+	//! Writes all of data. False if the pipe broke or ffmpeg exited.
+	bool writeToPipe( void *pipe, const uint8_t *data, size_t size );
+	void closePipe( void **pipe );
+#else
 	pid_t mFFmpegPid = -1;
+#endif
+	//! Marks the writer failed and unblocks producers waiting on the frame buffers.
+	void fail();
+	std::atomic< bool > mFailed { false };
+	//! Set when ffmpegThreadFn has finished starting ffmpeg (or failed to).
+	std::atomic< bool > mStartupDone { false };
+	void waitForStartup();
 
 	void setupFFmpeg();
 	void cleanupFFmpeg();

@@ -21,12 +21,22 @@
  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
+#if defined( _WIN32 )
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#endif
 
+#include <algorithm>
+#include <cstring>
 #include <sstream>
+#include <vector>
 
 #include "cinder/Log.h"
 #include "cinder/Utilities.h"
@@ -108,11 +118,36 @@ FFmpegMovieWriter::~FFmpegMovieWriter()
 void FFmpegMovieWriter::setupFFmpeg()
 {
 	mThreadFFmpegInitialized = false;
+	mStartupDone = false;
+	mFailed = false;
 	mNumAudioSamplesRecorded = 0;
 	mNumVideoFramesRecorded = 0;
 
 	mThreadFFmpeg = std::shared_ptr< std::thread >( new std::thread(
 				std::bind( &FFmpegMovieWriter::ffmpegThreadFn, this ) ) );
+}
+
+void FFmpegMovieWriter::waitForStartup()
+{
+	// Starting ffmpeg is quick (nothing in ffmpegThreadFn waits for ffmpeg itself);
+	// waiting for it keeps the first frames from being dropped
+	while ( ! mStartupDone )
+	{
+		std::this_thread::yield();
+	}
+}
+
+void FFmpegMovieWriter::fail()
+{
+	mFailed = true;
+	if ( mVideoFrames )
+	{
+		mVideoFrames->cancel();
+	}
+	if ( mAudioFrames )
+	{
+		mAudioFrames->cancel();
+	}
 }
 
 void FFmpegMovieWriter::ffmpegThreadFn()
@@ -134,6 +169,29 @@ void FFmpegMovieWriter::ffmpegThreadFn()
 	}
 	outputSettings << " \"" << mPathMovie.string() << "\"";
 
+#if defined( _WIN32 )
+	const std::string pipePrefix = "\\\\.\\pipe\\ffmpegmoviewriter_" +
+		std::to_string( ::GetCurrentProcessId() ) + "_" + std::to_string( sPipeId );
+	if ( mFormat.mRecordVideo )
+	{
+		mPipeVideo = pipePrefix + "_video";
+		mPipeHandleVideo = createPipe( mPipeVideo );
+	}
+	if ( mFormat.mRecordAudio )
+	{
+		mPipeAudio = pipePrefix + "_audio";
+		mPipeHandleAudio = createPipe( mPipeAudio );
+	}
+	if ( ( mFormat.mRecordVideo && ! mPipeHandleVideo ) ||
+		 ( mFormat.mRecordAudio && ! mPipeHandleAudio ) )
+	{
+		closePipe( &mPipeHandleVideo );
+		closePipe( &mPipeHandleAudio );
+		fail();
+		mStartupDone = true;
+		return;
+	}
+#else
 	if ( mFormat.mRecordVideo )
 	{
 		mPipeVideo = app::getAppPath() / ( "pipevideo" + std::to_string( sPipeId ) );
@@ -150,11 +208,12 @@ void FFmpegMovieWriter::ffmpegThreadFn()
 			mkfifo( mPipeAudio.string().c_str(), 0666 );
 		}
 	}
+#endif
 	sPipeId++;
 
 	std::stringstream cmd;
-		cmd << mFormat.mPathFFmpeg <<
-		( mFormat.mVerbose ? "" : " -loglevel quiet " ) << "-y";
+	cmd << "\"" << mFormat.mPathFFmpeg.string() << "\"" <<
+		( mFormat.mVerbose ? "" : " -loglevel quiet" ) << " -y";
 	if ( mFormat.mRecordAudio )
 	{
 		cmd << " -c:a pcm_f32le -f f32le -ar " << mFormat.mAudioSampleRate <<
@@ -173,7 +232,7 @@ void FFmpegMovieWriter::ffmpegThreadFn()
 
 		int code = mFormat.mVideoChannelOrder.getCode();
 		std::string pixelFormat = "rgb24";
-		if ( code < pixelFormats.size() )
+		if ( code >= 0 && code < (int)pixelFormats.size() )
 		{
 			pixelFormat = pixelFormats[ code ];
 		}
@@ -188,6 +247,31 @@ void FFmpegMovieWriter::ffmpegThreadFn()
 	}
 	cmd << " " + outputSettings.str();
 	std::string command = cmd.str();
+
+#if defined( _WIN32 )
+	STARTUPINFOA startupInfo;
+	ZeroMemory( &startupInfo, sizeof( startupInfo ) );
+	startupInfo.cb = sizeof( startupInfo );
+	PROCESS_INFORMATION processInfo;
+	ZeroMemory( &processInfo, sizeof( processInfo ) );
+
+	std::vector< char > commandLine( command.begin(), command.end() );
+	commandLine.push_back( 0 );
+	if ( ! ::CreateProcessA( nullptr, commandLine.data(), nullptr, nullptr, FALSE,
+				CREATE_NO_WINDOW, nullptr, nullptr, &startupInfo, &processInfo ) )
+	{
+		CI_LOG_E( "could not start ffmpeg (error " << ::GetLastError() << "): " << command );
+		closePipe( &mPipeHandleVideo );
+		closePipe( &mPipeHandleAudio );
+		fail();
+		mStartupDone = true;
+		return;
+	}
+	::CloseHandle( processInfo.hThread );
+	mFFmpegProcess = processInfo.hProcess;
+	mThreadFFmpegInitialized = true;
+	CI_LOG_I( "ffmpeg started (pid " << processInfo.dwProcessId << "): " << command );
+#else
 	const char *scriptArg = command.c_str();	// the child must not allocate between fork and exec
 
 	pid_t pid = ::fork();
@@ -197,7 +281,8 @@ void FFmpegMovieWriter::ffmpegThreadFn()
 		CI_LOG_E( "fork failed for ffmpeg: " << ::strerror( serrno ) << "." );
 		// Without ffmpeg reading the fifos the writer threads would block forever
 		// in open(), so don't start them
-		// TODO: throw
+		fail();
+		mStartupDone = true;
 		return;
 	}
 	else
@@ -212,6 +297,7 @@ void FFmpegMovieWriter::ffmpegThreadFn()
 		mThreadFFmpegInitialized = true;
 		CI_LOG_I( "ffmpeg started (pid " << mFFmpegPid << "): " << command );
 	}
+#endif
 
 	if ( mFormat.mRecordAudio )
 	{
@@ -221,13 +307,30 @@ void FFmpegMovieWriter::ffmpegThreadFn()
 	{
 		setupVideoThread();
 	}
+	mStartupDone = true;
 }
 
 void FFmpegMovieWriter::cleanupFFmpeg()
 {
-	// The fifo write-ends were closed by cleanupVideoThread()/cleanupAudioThread()
+	// The pipe write-ends were closed by cleanupVideoThread()/cleanupAudioThread()
 	// in the destructor, so ffmpeg has received EOF; wait for it to finish writing
 	// the moov atom and exit before the file is treated as complete.
+#if defined( _WIN32 )
+	closePipe( &mPipeHandleVideo );
+	closePipe( &mPipeHandleAudio );
+	if ( mFFmpegProcess )
+	{
+		::WaitForSingleObject( (HANDLE)mFFmpegProcess, INFINITE );
+		DWORD exitCode = 0;
+		if ( ::GetExitCodeProcess( (HANDLE)mFFmpegProcess, &exitCode ) && exitCode != 0 )
+		{
+			CI_LOG_E( "ffmpeg exited with status " << exitCode
+					<< ", the recording is probably incomplete." );
+		}
+		::CloseHandle( (HANDLE)mFFmpegProcess );
+		mFFmpegProcess = nullptr;
+	}
+#else
 	if ( mFFmpegPid > 0 )
 	{
 		int status = 0;
@@ -262,7 +365,120 @@ void FFmpegMovieWriter::cleanupFFmpeg()
 	{
 		fs::remove( mPipeAudio );
 	}
+#endif
 }
+
+#if defined( _WIN32 )
+void *FFmpegMovieWriter::createPipe( const fs::path &name )
+{
+	const DWORD kBufferSize = 4 * 1024 * 1024;
+	HANDLE pipe = ::CreateNamedPipeA( name.string().c_str(),
+			PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED,
+			PIPE_TYPE_BYTE | PIPE_WAIT, 1, kBufferSize, kBufferSize, 0, nullptr );
+	if ( pipe == INVALID_HANDLE_VALUE )
+	{
+		CI_LOG_E( "could not create pipe " << name << " (error " << ::GetLastError() << ")" );
+		return nullptr;
+	}
+	return pipe;
+}
+
+bool FFmpegMovieWriter::connectPipe( void *pipe )
+{
+	OVERLAPPED overlapped;
+	ZeroMemory( &overlapped, sizeof( overlapped ) );
+	overlapped.hEvent = ::CreateEventA( nullptr, TRUE, FALSE, nullptr );
+
+	bool connected = false;
+	if ( ::ConnectNamedPipe( (HANDLE)pipe, &overlapped ) )
+	{
+		connected = true;
+	}
+	else
+	{
+		const DWORD error = ::GetLastError();
+		if ( error == ERROR_PIPE_CONNECTED )
+		{
+			connected = true;
+		}
+		else
+		if ( error == ERROR_IO_PENDING )
+		{
+			// Wait for ffmpeg to open the pipe, or to exit without opening it
+			HANDLE handles[ 2 ] = { overlapped.hEvent, (HANDLE)mFFmpegProcess };
+			const DWORD result = ::WaitForMultipleObjects( 2, handles, FALSE, INFINITE );
+			if ( result == WAIT_OBJECT_0 )
+			{
+				DWORD transferred = 0;
+				connected = ::GetOverlappedResult( (HANDLE)pipe, &overlapped, &transferred, FALSE ) != 0;
+			}
+			else
+			{
+				::CancelIo( (HANDLE)pipe );
+				CI_LOG_E( "ffmpeg exited before opening its input pipe" );
+			}
+		}
+	}
+
+	::CloseHandle( overlapped.hEvent );
+	return connected;
+}
+
+bool FFmpegMovieWriter::writeToPipe( void *pipe, const uint8_t *data, size_t size )
+{
+	OVERLAPPED overlapped;
+	ZeroMemory( &overlapped, sizeof( overlapped ) );
+	overlapped.hEvent = ::CreateEventA( nullptr, TRUE, FALSE, nullptr );
+
+	bool ok = true;
+	while ( size > 0 )
+	{
+		const DWORD chunk = (DWORD)std::min< size_t >( size, 1 << 20 );
+		DWORD written = 0;
+		::ResetEvent( overlapped.hEvent );
+		if ( ! ::WriteFile( (HANDLE)pipe, data, chunk, nullptr, &overlapped ) )
+		{
+			if ( ::GetLastError() != ERROR_IO_PENDING )
+			{
+				CI_LOG_E( "write to pipe failed (error " << ::GetLastError() << ")" );
+				ok = false;
+				break;
+			}
+			// The pipe buffer is full; wait until ffmpeg reads, or exits
+			HANDLE handles[ 2 ] = { overlapped.hEvent, (HANDLE)mFFmpegProcess };
+			if ( ::WaitForMultipleObjects( 2, handles, FALSE, INFINITE ) != WAIT_OBJECT_0 )
+			{
+				::CancelIo( (HANDLE)pipe );
+				CI_LOG_E( "ffmpeg exited while writing to its input pipe" );
+				ok = false;
+				break;
+			}
+		}
+		if ( ! ::GetOverlappedResult( (HANDLE)pipe, &overlapped, &written, TRUE ) )
+		{
+			CI_LOG_E( "write to pipe failed (error " << ::GetLastError() << ")" );
+			ok = false;
+			break;
+		}
+		data += written;
+		size -= written;
+	}
+
+	::CloseHandle( overlapped.hEvent );
+	return ok;
+}
+
+void FFmpegMovieWriter::closePipe( void **pipe )
+{
+	if ( *pipe )
+	{
+		// Waits until ffmpeg has read everything; closing then signals EOF
+		::FlushFileBuffers( (HANDLE)*pipe );
+		::CloseHandle( (HANDLE)*pipe );
+		*pipe = nullptr;
+	}
+}
+#endif
 
 void FFmpegMovieWriter::setupVideoThread()
 {
@@ -301,11 +517,19 @@ void FFmpegMovieWriter::videoThreadFn()
 {
 	ThreadSetup threadSetup;
 
+#if defined( _WIN32 )
+	if ( ! connectPipe( mPipeHandleVideo ) )
+	{
+		fail();
+		return;
+	}
+#else
 	int fd = ::open( mPipeVideo.string().c_str(), O_WRONLY );
+#endif
 
 	Surface8uRef frame;
 
-	while ( ! mVideoThreadShouldQuit )
+	while ( ! mVideoThreadShouldQuit && ! mFailed )
 	{
 		if ( mVideoFrames->isNotEmpty() )
 		{
@@ -315,13 +539,20 @@ void FFmpegMovieWriter::videoThreadFn()
 				break;
 			}
 
-			int offset = 0;
-			int remaining = frame->getWidth() * frame->getHeight() *
+			const size_t size = (size_t)frame->getWidth() * frame->getHeight() *
 				frame->getPixelBytes();
+#if defined( _WIN32 )
+			if ( ! writeToPipe( mPipeHandleVideo, frame->getData(), size ) )
+			{
+				fail();
+			}
+#else
+			size_t offset = 0;
+			size_t remaining = size;
 
 			while ( remaining > 0 )
 			{
-				int written = ::write( fd, (char *)frame->getData() +
+				ssize_t written = ::write( fd, (char *)frame->getData() +
 						offset, remaining );
 				int serrno = errno;
 
@@ -335,6 +566,7 @@ void FFmpegMovieWriter::videoThreadFn()
 				{
 					CI_LOG_E( "Write to pipe failed with error -> " << serrno
 							<< " - " << ::strerror( serrno ) << "." );
+					fail();
 					break;
 				}
 
@@ -343,6 +575,7 @@ void FFmpegMovieWriter::videoThreadFn()
 					break;
 				}
 			}
+#endif
 
 			frame.reset();
 		}
@@ -352,17 +585,17 @@ void FFmpegMovieWriter::videoThreadFn()
 		}
 	}
 
+#if defined( _WIN32 )
+	closePipe( &mPipeHandleVideo );
+#else
 	::close( fd );
+#endif
 }
 
 void FFmpegMovieWriter::addFrame( SurfaceRef surface )
 {
-	if ( ! mThreadFFmpegInitialized )
-	{
-		CI_LOG_W( "Dropping video frame" );
-		return;
-	}
-	if ( ! mVideoFrames )
+	waitForStartup();
+	if ( mFailed || ! mThreadFFmpegInitialized || ! mVideoFrames )
 	{
 		return;
 	}
@@ -430,6 +663,16 @@ void FFmpegMovieWriter::cleanupAudioThread()
 
 	if ( mAudioFrames )
 	{
+		// Free the frames left behind when the thread stopped early after a failure
+		AudioFrame *frame = nullptr;
+		while ( mAudioFrames->tryPopBack( &frame ) )
+		{
+			if ( frame )
+			{
+				delete [] frame->mData;
+				delete frame;
+			}
+		}
 		mAudioFrames->cancel();
 		delete mAudioFrames;
 		mAudioFrames = nullptr;
@@ -440,9 +683,17 @@ void FFmpegMovieWriter::audioThreadFn()
 {
 	ThreadSetup threadSetup;
 
+#if defined( _WIN32 )
+	if ( ! connectPipe( mPipeHandleAudio ) )
+	{
+		fail();
+		return;
+	}
+#else
 	int fd = ::open( mPipeAudio.string().c_str(), O_WRONLY );
+#endif
 
-	while ( ! mAudioThreadShouldQuit )
+	while ( ! mAudioThreadShouldQuit && ! mFailed )
 	{
 		AudioFrame *frame = nullptr;
 
@@ -454,12 +705,19 @@ void FFmpegMovieWriter::audioThreadFn()
 				break;
 			}
 
-			int offset = 0;
-			int remaining = frame->mSize * sizeof( float );
+			const size_t size = frame->mSize * sizeof( float );
+#if defined( _WIN32 )
+			if ( ! writeToPipe( mPipeHandleAudio, (const uint8_t *)frame->mData, size ) )
+			{
+				fail();
+			}
+#else
+			size_t offset = 0;
+			size_t remaining = size;
 
 			while ( remaining > 0 )
 			{
-				int written = ::write( fd, (uint8_t *)frame->mData + offset,
+				ssize_t written = ::write( fd, (uint8_t *)frame->mData + offset,
 						remaining );
 				int serrno = errno;
 
@@ -473,6 +731,7 @@ void FFmpegMovieWriter::audioThreadFn()
 				{
 					CI_LOG_E( "Write to pipe failed with error -> " << serrno
 							<< " - " << strerror( serrno ) << "." );
+					fail();
 					break;
 				}
 
@@ -481,6 +740,7 @@ void FFmpegMovieWriter::audioThreadFn()
 					break;
 				}
 			}
+#endif
 
 			delete [] frame->mData;
 			delete frame;
@@ -492,17 +752,17 @@ void FFmpegMovieWriter::audioThreadFn()
 		}
 	}
 
+#if defined( _WIN32 )
+	closePipe( &mPipeHandleAudio );
+#else
 	::close( fd );
+#endif
 }
 
 void FFmpegMovieWriter::addAudioBuffer( const audio::Buffer *buffer )
 {
-	if ( ! mThreadFFmpegInitialized )
-	{
-		CI_LOG_W( "Dropping audio frame" );
-		return;
-	}
-	if ( ! mAudioFrames )
+	waitForStartup();
+	if ( mFailed || ! mThreadFFmpegInitialized || ! mAudioFrames )
 	{
 		return;
 	}
